@@ -6,9 +6,16 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:audioplayers/audioplayers.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:uuid/uuid.dart';
 
+import 'package:hanbut/ads/ad_service.dart';
+import 'package:hanbut/ads/safe_banner_ad.dart';
+import 'package:hanbut/game_rules.dart';
 import 'package:hanbut/game_high_score_repository.dart';
+import 'package:hanbut/nickname_policy.dart';
+import 'package:hanbut/privacy/privacy_page.dart';
 import 'package:hanbut/supabase_project.dart';
 
 Future<void> main() async {
@@ -18,10 +25,13 @@ Future<void> main() async {
     anonKey: SupabaseProject.publishableKey,
   );
   runApp(const HanbutApp());
+  unawaited(AdService.instance.initialize());
 }
 
 class HanbutApp extends StatelessWidget {
-  const HanbutApp({super.key});
+  const HanbutApp({super.key, this.home});
+
+  final Widget? home;
 
   @override
   Widget build(BuildContext context) {
@@ -32,13 +42,16 @@ class HanbutApp extends StatelessWidget {
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.lightBlue),
         useMaterial3: true,
       ),
-      home: const HomePage(),
+      home: home ?? const HomePage(),
     );
   }
 }
 
 class HomePage extends StatefulWidget {
-  const HomePage({super.key});
+  const HomePage({super.key, this.highScoreRepository, this.onPlayGame});
+
+  final GameHighScoreRepository? highScoreRepository;
+  final Future<GameResult?> Function()? onPlayGame;
 
   @override
   State<HomePage> createState() => _HomePageState();
@@ -47,26 +60,40 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   static const String _historyStorageKey = 'cloud_connect_history';
   static const String _nicknameStorageKey = 'cloud_connect_nickname';
+  static const String _playerIdStorageKey = 'cloud_connect_player_id';
+  static const String _blockedScoreIdsStorageKey = 'blocked_score_ids';
   static const int _maxHistoryLength = 100;
-  static const String _appVersion = '1.0.4';
 
-  final GameHighScoreRepository _highScoreRepository =
-      GameHighScoreRepository();
+  late final GameHighScoreRepository _highScoreRepository =
+      widget.highScoreRepository ?? GameHighScoreRepository();
   List<GameResult> _history = <GameResult>[];
   bool _isLoadingHistory = true;
   String _savedNickname = '';
+  String _playerId = '';
+  Set<int> _blockedScoreIds = <int>{};
+  String _appVersion = '1.1.1 (38)';
 
   @override
   void initState() {
     super.initState();
-    _loadHistory();
+    _loadInitialState();
   }
 
-  Future<void> _loadHistory() async {
+  Future<void> _loadInitialState() async {
     final SharedPreferences prefs = await SharedPreferences.getInstance();
     final List<String>? stored = prefs.getStringList(_historyStorageKey);
     final String savedNickname =
         prefs.getString(_nicknameStorageKey)?.trim() ?? '';
+    String playerId = prefs.getString(_playerIdStorageKey)?.trim() ?? '';
+    if (playerId.isEmpty) {
+      playerId = const Uuid().v4();
+      await prefs.setString(_playerIdStorageKey, playerId);
+    }
+    final Set<int> blockedScoreIds =
+        (prefs.getStringList(_blockedScoreIdsStorageKey) ?? const <String>[])
+            .map(int.tryParse)
+            .whereType<int>()
+            .toSet();
 
     if (!mounted) {
       return;
@@ -75,8 +102,11 @@ class _HomePageState extends State<HomePage> {
     if (stored == null) {
       setState(() {
         _savedNickname = savedNickname;
+        _playerId = playerId;
+        _blockedScoreIds = blockedScoreIds;
         _isLoadingHistory = false;
       });
+      unawaited(_loadAppVersion());
       return;
     }
 
@@ -98,8 +128,25 @@ class _HomePageState extends State<HomePage> {
     setState(() {
       _history = parsed;
       _savedNickname = savedNickname;
+      _playerId = playerId;
+      _blockedScoreIds = blockedScoreIds;
       _isLoadingHistory = false;
     });
+    unawaited(_loadAppVersion());
+  }
+
+  Future<void> _loadAppVersion() async {
+    try {
+      final PackageInfo packageInfo = await PackageInfo.fromPlatform();
+      final String appVersion = packageInfo.buildNumber.isEmpty
+          ? packageInfo.version
+          : '${packageInfo.version} (${packageInfo.buildNumber})';
+      if (mounted) {
+        setState(() => _appVersion = appVersion);
+      }
+    } catch (_) {
+      // Keep the build-time fallback when metadata is unavailable.
+    }
   }
 
   Future<void> _persistHistory(List<GameResult> entries) async {
@@ -139,11 +186,14 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _startGame(BuildContext context) async {
-    final GameResult? result = await Navigator.of(context).push<GameResult>(
-      MaterialPageRoute<GameResult>(
-        builder: (BuildContext context) => const CloudConnectPage(),
-      ),
-    );
+    final NavigatorState navigator = Navigator.of(context);
+    final GameResult? result = widget.onPlayGame != null
+        ? await widget.onPlayGame!()
+        : await navigator.push<GameResult>(
+            MaterialPageRoute<GameResult>(
+              builder: (BuildContext context) => const CloudConnectPage(),
+            ),
+          );
 
     if (!mounted || result == null) {
       return;
@@ -208,6 +258,7 @@ class _HomePageState extends State<HomePage> {
         score: result.score,
         lastStage: result.lastStage,
         playedAt: result.finishedAt,
+        playerId: _playerId.isEmpty ? null : _playerId,
       );
 
       if (!mounted) {
@@ -262,6 +313,64 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  Future<void> _reportAndBlockScore(
+    BuildContext sheetContext,
+    RemoteHighScoreEntry entry,
+    StateSetter setModalState,
+  ) async {
+    final int? scoreId = entry.id;
+    if (scoreId == null || _playerId.isEmpty) {
+      return;
+    }
+
+    final bool? confirmed = await showDialog<bool>(
+      context: sheetContext,
+      builder: (BuildContext dialogContext) => AlertDialog(
+        title: const Text('기록 신고 및 숨기기'),
+        content: Text('“${entry.nickname}” 기록을 부적절한 닉네임으로 신고하고 이 기기에서 숨길까요?'),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('취소'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('신고 및 숨기기'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) {
+      return;
+    }
+
+    final SharedPreferences prefs = await SharedPreferences.getInstance();
+    _blockedScoreIds.add(scoreId);
+    await prefs.setStringList(
+      _blockedScoreIdsStorageKey,
+      _blockedScoreIds.map((int id) => '$id').toList(growable: false),
+    );
+    if (mounted) {
+      setState(() {});
+    }
+    setModalState(() {});
+
+    try {
+      await _highScoreRepository.reportHighScore(
+        scoreId: scoreId,
+        reporterId: _playerId,
+        reason: 'inappropriate_nickname',
+      );
+      if (mounted) {
+        _showSnackBar('신고를 접수하고 해당 기록을 숨겼어요.');
+      }
+    } catch (_) {
+      if (mounted) {
+        _showSnackBar('기록은 이 기기에서 숨겼지만 신고 전송에 실패했어요.', isError: true);
+      }
+    }
+  }
+
   void _showMyHistorySheet() {
     showModalBottomSheet<void>(
       context: context,
@@ -274,8 +383,8 @@ class _HomePageState extends State<HomePage> {
           _history.reversed,
         );
         final double maxHeight = min(
-          MediaQuery.of(context).size.height * 0.7,
-          480,
+          MediaQuery.of(context).size.height * 0.52,
+          360,
         );
 
         return SafeArea(
@@ -302,6 +411,8 @@ class _HomePageState extends State<HomePage> {
                   ],
                 ),
                 const SizedBox(height: 16),
+                const SafeBannerAd(placement: BannerPlacement.myScores),
+                const SizedBox(height: 12),
                 if (entries.isEmpty)
                   Container(
                     width: double.infinity,
@@ -395,8 +506,8 @@ class _HomePageState extends State<HomePage> {
       ),
       builder: (BuildContext context) {
         final double maxHeight = min(
-          MediaQuery.of(context).size.height * 0.7,
-          520,
+          MediaQuery.of(context).size.height * 0.5,
+          380,
         );
         RemoteHighScoreSort currentSort = RemoteHighScoreSort.score;
         Future<List<RemoteHighScoreEntry>> future = _highScoreRepository
@@ -428,9 +539,8 @@ class _HomePageState extends State<HomePage> {
                       children: <Widget>[
                         Text(
                           '다른 사람 기록',
-                          style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                            fontWeight: FontWeight.bold,
-                          ),
+                          style: Theme.of(context).textTheme.titleLarge
+                              ?.copyWith(fontWeight: FontWeight.bold),
                         ),
                         const Spacer(),
                         IconButton(
@@ -444,22 +554,24 @@ class _HomePageState extends State<HomePage> {
                     Wrap(
                       spacing: 8,
                       runSpacing: 8,
-                      children: RemoteHighScoreSort.values.map((
-                        RemoteHighScoreSort sort,
-                      ) {
-                        return ChoiceChip(
-                          label: Text(_sortLabel(sort)),
-                          selected: currentSort == sort,
-                          onSelected: (bool selected) {
-                            if (!selected || currentSort == sort) {
-                              return;
-                            }
-                            refreshScores(sort);
-                          },
-                        );
-                      }).toList(growable: false),
+                      children: RemoteHighScoreSort.values
+                          .map((RemoteHighScoreSort sort) {
+                            return ChoiceChip(
+                              label: Text(_sortLabel(sort)),
+                              selected: currentSort == sort,
+                              onSelected: (bool selected) {
+                                if (!selected || currentSort == sort) {
+                                  return;
+                                }
+                                refreshScores(sort);
+                              },
+                            );
+                          })
+                          .toList(growable: false),
                     ),
                     const SizedBox(height: 16),
+                    const SafeBannerAd(placement: BannerPlacement.leaderboard),
+                    const SizedBox(height: 12),
                     FutureBuilder<List<RemoteHighScoreEntry>>(
                       future: future,
                       builder:
@@ -467,128 +579,162 @@ class _HomePageState extends State<HomePage> {
                             BuildContext context,
                             AsyncSnapshot<List<RemoteHighScoreEntry>> snapshot,
                           ) {
-                        if (snapshot.connectionState == ConnectionState.waiting) {
-                          return const Padding(
-                            padding: EdgeInsets.symmetric(vertical: 40),
-                            child: Center(child: CircularProgressIndicator()),
-                          );
-                        }
-
-                        if (snapshot.hasError) {
-                          return Container(
-                            width: double.infinity,
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 16,
-                              vertical: 24,
-                            ),
-                            decoration: BoxDecoration(
-                              color: Colors.red.shade50,
-                              borderRadius: BorderRadius.circular(20),
-                            ),
-                            child: const Text(
-                              '다른 사람 기록을 불러오지 못했어요.\n잠시 후 다시 시도해주세요.',
-                              textAlign: TextAlign.center,
-                            ),
-                          );
-                        }
-
-                        final List<RemoteHighScoreEntry> entries =
-                            snapshot.data ?? const <RemoteHighScoreEntry>[];
-
-                        if (entries.isEmpty) {
-                          return Container(
-                            width: double.infinity,
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 16,
-                              vertical: 24,
-                            ),
-                            decoration: BoxDecoration(
-                              color: Colors.lightBlue.shade50,
-                              borderRadius: BorderRadius.circular(20),
-                            ),
-                            child: const Text(
-                              '아직 등록된 다른 사람 기록이 없어요.',
-                              textAlign: TextAlign.center,
-                            ),
-                          );
-                        }
-
-                        return SizedBox(
-                          height: maxHeight,
-                          child: ListView.separated(
-                            itemCount: entries.length,
-                            separatorBuilder: (_, __) => const SizedBox(height: 12),
-                            itemBuilder: (BuildContext context, int index) {
-                              final RemoteHighScoreEntry entry = entries[index];
-                              final int rank = index + 1;
-                              return Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 16,
-                                  vertical: 14,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: Colors.white,
-                                  borderRadius: BorderRadius.circular(18),
-                                  boxShadow: <BoxShadow>[
-                                    BoxShadow(
-                                      color: Colors.blueGrey.withValues(alpha: 0.08),
-                                      blurRadius: 10,
-                                      offset: const Offset(0, 6),
-                                    ),
-                                  ],
-                                ),
-                                child: Row(
-                                  children: <Widget>[
-                                    _buildOtherScoreBadge(
-                                      context,
-                                      sort: currentSort,
-                                      rank: rank,
-                                    ),
-                                    const SizedBox(width: 16),
-                                    Expanded(
-                                      child: Column(
-                                        crossAxisAlignment: CrossAxisAlignment.start,
-                                        children: <Widget>[
-                                          Text(
-                                            entry.nickname,
-                                            style: Theme.of(context)
-                                                .textTheme
-                                                .titleMedium
-                                                ?.copyWith(
-                                                  fontWeight: FontWeight.bold,
-                                                ),
-                                          ),
-                                          const SizedBox(height: 4),
-                                          Text(
-                                            'Stage ${entry.lastStage} · ${_formatTimestamp(entry.playedAt)}',
-                                            style: Theme.of(context)
-                                                .textTheme
-                                                .bodySmall
-                                                ?.copyWith(
-                                                  color: Colors.blueGrey.shade600,
-                                                ),
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                    const SizedBox(width: 12),
-                                    Text(
-                                      '${entry.score}점',
-                                      style: Theme.of(context)
-                                          .textTheme
-                                          .titleMedium
-                                          ?.copyWith(
-                                            fontWeight: FontWeight.w700,
-                                            color: Colors.blueGrey.shade800,
-                                          ),
-                                    ),
-                                  ],
+                            if (snapshot.connectionState ==
+                                ConnectionState.waiting) {
+                              return const Padding(
+                                padding: EdgeInsets.symmetric(vertical: 40),
+                                child: Center(
+                                  child: CircularProgressIndicator(),
                                 ),
                               );
-                            },
-                          ),
-                        );
-                      },
+                            }
+
+                            if (snapshot.hasError) {
+                              return Container(
+                                width: double.infinity,
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 16,
+                                  vertical: 24,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: Colors.red.shade50,
+                                  borderRadius: BorderRadius.circular(20),
+                                ),
+                                child: const Text(
+                                  '다른 사람 기록을 불러오지 못했어요.\n잠시 후 다시 시도해주세요.',
+                                  textAlign: TextAlign.center,
+                                ),
+                              );
+                            }
+
+                            final List<RemoteHighScoreEntry> entries =
+                                (snapshot.data ??
+                                        const <RemoteHighScoreEntry>[])
+                                    .where(
+                                      (RemoteHighScoreEntry entry) =>
+                                          entry.id == null ||
+                                          !_blockedScoreIds.contains(entry.id),
+                                    )
+                                    .toList(growable: false);
+
+                            if (entries.isEmpty) {
+                              return Container(
+                                width: double.infinity,
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 16,
+                                  vertical: 24,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: Colors.lightBlue.shade50,
+                                  borderRadius: BorderRadius.circular(20),
+                                ),
+                                child: const Text(
+                                  '아직 등록된 다른 사람 기록이 없어요.',
+                                  textAlign: TextAlign.center,
+                                ),
+                              );
+                            }
+
+                            return SizedBox(
+                              height: maxHeight,
+                              child: ListView.separated(
+                                itemCount: entries.length,
+                                separatorBuilder: (_, __) =>
+                                    const SizedBox(height: 12),
+                                itemBuilder: (BuildContext context, int index) {
+                                  final RemoteHighScoreEntry entry =
+                                      entries[index];
+                                  final int rank = index + 1;
+                                  return Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 16,
+                                      vertical: 14,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: Colors.white,
+                                      borderRadius: BorderRadius.circular(18),
+                                      boxShadow: <BoxShadow>[
+                                        BoxShadow(
+                                          color: Colors.blueGrey.withValues(
+                                            alpha: 0.08,
+                                          ),
+                                          blurRadius: 10,
+                                          offset: const Offset(0, 6),
+                                        ),
+                                      ],
+                                    ),
+                                    child: Row(
+                                      children: <Widget>[
+                                        _buildOtherScoreBadge(
+                                          context,
+                                          sort: currentSort,
+                                          rank: rank,
+                                        ),
+                                        const SizedBox(width: 16),
+                                        Expanded(
+                                          child: Column(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.start,
+                                            children: <Widget>[
+                                              Text(
+                                                entry.nickname,
+                                                style: Theme.of(context)
+                                                    .textTheme
+                                                    .titleMedium
+                                                    ?.copyWith(
+                                                      fontWeight:
+                                                          FontWeight.bold,
+                                                    ),
+                                              ),
+                                              const SizedBox(height: 4),
+                                              Text(
+                                                'Stage ${entry.lastStage} · ${_formatTimestamp(entry.playedAt)}',
+                                                style: Theme.of(context)
+                                                    .textTheme
+                                                    .bodySmall
+                                                    ?.copyWith(
+                                                      color: Colors
+                                                          .blueGrey
+                                                          .shade600,
+                                                    ),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                        const SizedBox(width: 12),
+                                        Text(
+                                          '${entry.score}점',
+                                          style: Theme.of(context)
+                                              .textTheme
+                                              .titleMedium
+                                              ?.copyWith(
+                                                fontWeight: FontWeight.w700,
+                                                color: Colors.blueGrey.shade800,
+                                              ),
+                                        ),
+                                        if (entry.id != null) ...<Widget>[
+                                          const SizedBox(width: 4),
+                                          IconButton(
+                                            onPressed: () =>
+                                                _reportAndBlockScore(
+                                                  context,
+                                                  entry,
+                                                  setModalState,
+                                                ),
+                                            icon: const Icon(
+                                              Icons.flag_outlined,
+                                              size: 20,
+                                            ),
+                                            tooltip: '신고 및 숨기기',
+                                          ),
+                                        ],
+                                      ],
+                                    ),
+                                  );
+                                },
+                              ),
+                            );
+                          },
                     ),
                   ],
                 ),
@@ -641,8 +787,8 @@ class _HomePageState extends State<HomePage> {
         sort == RemoteHighScoreSort.latest
             ? Icons.schedule_rounded
             : sort == RemoteHighScoreSort.oldest
-                ? Icons.history_rounded
-                : Icons.flag_rounded,
+            ? Icons.history_rounded
+            : Icons.flag_rounded,
         color: Colors.blueGrey.shade800,
       ),
     );
@@ -657,12 +803,10 @@ class _HomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
-    final GameResult? latestResult =
-        _history.isNotEmpty ? _history.last : null;
+    final GameResult? latestResult = _history.isNotEmpty ? _history.last : null;
     final GameResult? bestResult = _history.isNotEmpty
         ? _history.reduce(
-            (GameResult a, GameResult b) =>
-                a.score >= b.score ? a : b,
+            (GameResult a, GameResult b) => a.score >= b.score ? a : b,
           )
         : null;
     final bool latestIsBest =
@@ -786,7 +930,9 @@ class _HomePageState extends State<HomePage> {
                             shape: RoundedRectangleBorder(
                               borderRadius: BorderRadius.circular(16),
                             ),
-                            backgroundColor: Colors.white.withValues(alpha: 0.7),
+                            backgroundColor: Colors.white.withValues(
+                              alpha: 0.7,
+                            ),
                           ),
                           child: const Text(
                             '다른 사람 기록 보기',
@@ -797,6 +943,8 @@ class _HomePageState extends State<HomePage> {
                           ),
                         ),
                       ),
+                      const SizedBox(height: 20),
+                      const SafeBannerAd(placement: BannerPlacement.home),
                       if (_isLoadingHistory)
                         const Padding(
                           padding: EdgeInsets.only(top: 32),
@@ -818,7 +966,9 @@ class _HomePageState extends State<HomePage> {
                               title: '최고 기록',
                               stageLabel: 'Stage ${bestResult.lastStage}',
                               scoreLabel: '${bestResult.score}점',
-                              timestamp: _formatTimestamp(bestResult.finishedAt),
+                              timestamp: _formatTimestamp(
+                                bestResult.finishedAt,
+                              ),
                               highlight: true,
                             ),
                           ),
@@ -832,9 +982,7 @@ class _HomePageState extends State<HomePage> {
                             children: <Widget>[
                               Text(
                                 'thanks to Lovy',
-                                style: Theme.of(context)
-                                    .textTheme
-                                    .titleMedium
+                                style: Theme.of(context).textTheme.titleMedium
                                     ?.copyWith(
                                       color: Colors.lightBlue.shade300,
                                       fontStyle: FontStyle.italic,
@@ -851,10 +999,21 @@ class _HomePageState extends State<HomePage> {
                           ),
                           const SizedBox(height: 6),
                           Text(
-                            'v$_appVersion',
-                            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                                  color: Colors.blueGrey.shade400,
-                                ),
+                            _appVersion.isEmpty ? '' : 'v$_appVersion',
+                            style: Theme.of(context).textTheme.bodySmall
+                                ?.copyWith(color: Colors.blueGrey.shade400),
+                          ),
+                          TextButton.icon(
+                            onPressed: () => Navigator.of(context).push<void>(
+                              MaterialPageRoute<void>(
+                                builder: (_) => const PrivacyPage(),
+                              ),
+                            ),
+                            icon: const Icon(
+                              Icons.privacy_tip_outlined,
+                              size: 16,
+                            ),
+                            label: const Text('개인정보 및 광고 설정'),
                           ),
                         ],
                       ),
@@ -986,6 +1145,8 @@ class _NicknamePromptDialogState extends State<_NicknamePromptDialog> {
   late final TextEditingController _controller = TextEditingController(
     text: widget.initialNickname,
   );
+  bool _acceptedCommunityRules = false;
+  String? _errorText;
 
   @override
   void dispose() {
@@ -994,11 +1155,16 @@ class _NicknamePromptDialogState extends State<_NicknamePromptDialog> {
   }
 
   void _submit() {
-    final String nickname = _controller.text.trim();
-    if (nickname.isEmpty) {
+    final NicknameValidation validation = NicknamePolicy.validate(
+      _controller.text,
+    );
+    if (!validation.isValid || !_acceptedCommunityRules) {
+      setState(() {
+        _errorText = validation.error ?? '공개 랭킹 이용 규칙에 동의해주세요.';
+      });
       return;
     }
-    Navigator.of(context).pop(nickname);
+    Navigator.of(context).pop(validation.value);
   }
 
   @override
@@ -1039,8 +1205,30 @@ class _NicknamePromptDialogState extends State<_NicknamePromptDialog> {
               labelText: '닉네임',
               hintText: '닉네임을 입력하세요',
             ),
+            onChanged: (_) {
+              if (_errorText != null) {
+                setState(() => _errorText = null);
+              }
+            },
             onSubmitted: (_) => _submit(),
           ),
+          CheckboxListTile(
+            value: _acceptedCommunityRules,
+            contentPadding: EdgeInsets.zero,
+            controlAffinity: ListTileControlAffinity.leading,
+            title: const Text('닉네임이 공개되며 욕설·광고·개인정보를 올리지 않는 데 동의해요.'),
+            onChanged: (bool? value) {
+              setState(() {
+                _acceptedCommunityRules = value ?? false;
+                _errorText = null;
+              });
+            },
+          ),
+          if (_errorText != null)
+            Text(
+              _errorText!,
+              style: TextStyle(color: Theme.of(context).colorScheme.error),
+            ),
         ],
       ),
       actions: <Widget>[
@@ -1049,7 +1237,7 @@ class _NicknamePromptDialogState extends State<_NicknamePromptDialog> {
           child: const Text('건너뛰기'),
         ),
         FilledButton(
-          onPressed: _submit,
+          onPressed: _acceptedCommunityRules ? _submit : null,
           child: const Text('저장'),
         ),
       ],
@@ -1074,7 +1262,7 @@ class _CloudNode {
 }
 
 class _CloudConnectPageState extends State<CloudConnectPage>
-    with SingleTickerProviderStateMixin {
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   static const double _cloudRadius = 36;
   static const double _cloudIconSize = 64;
   static const double _stagePadding = 24;
@@ -1098,6 +1286,7 @@ class _CloudConnectPageState extends State<CloudConnectPage>
   Size? _playAreaSize;
   String? _statusMessage;
   bool _touchActive = false;
+  bool _pausedByLifecycle = false;
   GameResult? _failureSummary;
   late final AnimationController _fireworksController;
   bool _showFireworks = false;
@@ -1140,24 +1329,27 @@ class _CloudConnectPageState extends State<CloudConnectPage>
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _audioReady = _prepareAudio();
-    _fireworksController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 1200),
-    )..addStatusListener((AnimationStatus status) {
-        if (status == AnimationStatus.completed) {
-          if (!mounted) {
-            return;
+    _fireworksController =
+        AnimationController(
+          vsync: this,
+          duration: const Duration(milliseconds: 1200),
+        )..addStatusListener((AnimationStatus status) {
+          if (status == AnimationStatus.completed) {
+            if (!mounted) {
+              return;
+            }
+            setState(() {
+              _showFireworks = false;
+            });
           }
-          setState(() {
-            _showFireworks = false;
-          });
-        }
-      });
+        });
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _timer?.cancel();
     _nextStageTimer?.cancel();
     _clearPlayer.dispose();
@@ -1165,6 +1357,31 @@ class _CloudConnectPageState extends State<CloudConnectPage>
     _failPlayer.dispose();
     _fireworksController.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      if (!_pausedByLifecycle) {
+        return;
+      }
+      _pausedByLifecycle = false;
+      if (_status == _StageStatus.playing) {
+        _startPlayTimer();
+      } else if (_status == _StageStatus.success && !_nextStagePaused) {
+        _startNextStageCountdown();
+      }
+      return;
+    }
+
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.detached) {
+      _pausedByLifecycle = true;
+      _timer?.cancel();
+      _nextStageTimer?.cancel();
+    }
   }
 
   void _onStageAreaReady(Size size) {
@@ -1177,10 +1394,40 @@ class _CloudConnectPageState extends State<CloudConnectPage>
         _playAreaSize!.width != size.width ||
         _playAreaSize!.height != size.height;
 
-    if (hasSizeChanged) {
+    if (hasSizeChanged && _playAreaSize != null) {
+      final Size previousSize = _playAreaSize!;
+      final double scaleX = previousSize.width == 0
+          ? 1
+          : size.width / previousSize.width;
+      final double scaleY = previousSize.height == 0
+          ? 1
+          : size.height / previousSize.height;
+      Offset rescale(Offset point) => Offset(
+        (point.dx * scaleX).clamp(0, size.width),
+        (point.dy * scaleY).clamp(0, size.height),
+      );
       setState(() {
         _playAreaSize = size;
+        _safeNodes = _safeNodes
+            .map(
+              (_CloudNode node) =>
+                  _CloudNode(position: rescale(node.position), isDanger: false),
+            )
+            .toList(growable: false);
+        _dangerNodes = _dangerNodes
+            .map(
+              (_CloudNode node) =>
+                  _CloudNode(position: rescale(node.position), isDanger: true),
+            )
+            .toList(growable: false);
+        _pathPoints = _pathPoints.map(rescale).toList(growable: false);
+        _pathVersion += 1;
       });
+      return;
+    }
+
+    if (hasSizeChanged) {
+      setState(() => _playAreaSize = size);
       _beginStage();
       return;
     }
@@ -1208,7 +1455,7 @@ class _CloudConnectPageState extends State<CloudConnectPage>
       return;
     }
 
-    final int safeCount = _stage + 1;
+    final int safeCount = GameRules.safeNodeCount(_stage);
     final int dangerCount = _computeDangerCount();
     final ({List<_CloudNode> safeNodes, List<_CloudNode> dangerNodes})
     stageNodes = _generateStageNodes(
@@ -1237,6 +1484,14 @@ class _CloudConnectPageState extends State<CloudConnectPage>
       _nextStagePaused = false;
     });
 
+    _startPlayTimer();
+  }
+
+  void _startPlayTimer() {
+    _timer?.cancel();
+    if (_pausedByLifecycle || _status != _StageStatus.playing) {
+      return;
+    }
     _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
       if (!mounted) {
         timer.cancel();
@@ -1260,18 +1515,7 @@ class _CloudConnectPageState extends State<CloudConnectPage>
   }
 
   int _computeTimeLimit(int safeCount) {
-    final int stage = _stage;
-    final base = 8;
-    final perNode = 3;
-    final computed = base + safeCount * perNode;
-
-    if (stage >= 40) {
-      return 20;
-    }
-    if (stage >= 30) {
-      return 25;
-    }
-    return computed.clamp(8, 30);
+    return GameRules.stageTimeLimit(_stage);
   }
 
   int _computeDangerCount() {
@@ -1376,10 +1620,14 @@ class _CloudConnectPageState extends State<CloudConnectPage>
         cos(angle) * magnitude,
         sin(angle) * magnitude,
       );
-      final double dx = (base.dx + offset.dx)
-          .clamp(_stagePadding, area.width - _stagePadding);
-      final double dy = (base.dy + offset.dy)
-          .clamp(_stagePadding, area.height - _stagePadding);
+      final double dx = (base.dx + offset.dx).clamp(
+        _stagePadding,
+        area.width - _stagePadding,
+      );
+      final double dy = (base.dy + offset.dy).clamp(
+        _stagePadding,
+        area.height - _stagePadding,
+      );
       return Offset(dx, dy);
     }
 
@@ -1393,7 +1641,7 @@ class _CloudConnectPageState extends State<CloudConnectPage>
       double currentDistance = initialDistance;
       int failureStreak = 0;
       int attempts = 0;
-      const int maxAttempts = 15000;
+      const int maxAttempts = 3000;
 
       while (target.length < targetCount && attempts < maxAttempts) {
         attempts += 1;
@@ -1407,7 +1655,7 @@ class _CloudConnectPageState extends State<CloudConnectPage>
 
         failureStreak += 1;
 
-        if (failureStreak >= 450 && currentDistance > minDistanceFloor) {
+        if (failureStreak >= 120 && currentDistance > minDistanceFloor) {
           currentDistance = max(minDistanceFloor, currentDistance * 0.95);
           failureStreak = 0;
         }
@@ -1431,7 +1679,7 @@ class _CloudConnectPageState extends State<CloudConnectPage>
           Offset candidate = randomPosition();
           int localAttempts = 0;
           while (!canPlace(candidate, minDistanceFloor * 0.6) &&
-              localAttempts < 2000) {
+              localAttempts < 250) {
             candidate = jitter(candidate, minDistanceFloor * 0.4);
             localAttempts += 1;
           }
@@ -1531,8 +1779,9 @@ class _CloudConnectPageState extends State<CloudConnectPage>
     final int? safeIndex = _hitSafeNode(position);
     if (safeIndex != null) {
       final bool alreadyVisited = _visitedSafeNodes.contains(safeIndex);
-      final int? lastVisited =
-          _visitedSafeNodes.isNotEmpty ? _visitedSafeNodes.last : null;
+      final int? lastVisited = _visitedSafeNodes.isNotEmpty
+          ? _visitedSafeNodes.last
+          : null;
 
       if (alreadyVisited && safeIndex != lastVisited) {
         _failStage('이미 방문한 구름을 다시 건드렸어요!');
@@ -1813,22 +2062,23 @@ class _CloudConnectPageState extends State<CloudConnectPage>
                       Text(
                         '남은 시간',
                         style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                              color: Colors.blueGrey.shade500,
-                            ),
+                          color: Colors.blueGrey.shade500,
+                        ),
                       ),
                       AnimatedSwitcher(
                         duration: const Duration(milliseconds: 300),
                         transitionBuilder:
                             (Widget child, Animation<double> animation) {
-                          return ScaleTransition(
-                            scale: animation,
-                            child: child,
-                          );
-                        },
+                              return ScaleTransition(
+                                scale: animation,
+                                child: child,
+                              );
+                            },
                         child: Text(
                           '$_timeLeft초',
                           key: ValueKey<int>(_timeLeft),
-                          style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                          style: Theme.of(context).textTheme.titleMedium
+                              ?.copyWith(
                                 color: _timeLeft <= 5
                                     ? Colors.redAccent
                                     : Colors.blueGrey,
@@ -1846,22 +2096,23 @@ class _CloudConnectPageState extends State<CloudConnectPage>
                       Text(
                         '점수',
                         style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                              color: Colors.blueGrey.shade500,
-                            ),
+                          color: Colors.blueGrey.shade500,
+                        ),
                       ),
                       AnimatedSwitcher(
                         duration: const Duration(milliseconds: 250),
                         transitionBuilder:
                             (Widget child, Animation<double> animation) {
-                          return ScaleTransition(
-                            scale: animation,
-                            child: child,
-                          );
-                        },
+                              return ScaleTransition(
+                                scale: animation,
+                                child: child,
+                              );
+                            },
                         child: Text(
                           '$_score점',
                           key: ValueKey<int>(_score),
-                          style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                          style: Theme.of(context).textTheme.titleMedium
+                              ?.copyWith(
                                 color: Colors.blueGrey.shade700,
                                 fontWeight: FontWeight.w600,
                               ),
@@ -1945,22 +2196,19 @@ class _CloudConnectPageState extends State<CloudConnectPage>
                           child: IgnorePointer(
                             child: AnimatedBuilder(
                               animation: _fireworksController,
-                              builder:
-                                  (BuildContext context, Widget? child) {
-                                final double value =
-                                    _fireworksController.value.clamp(0.0, 1.0);
-                                final double opacity = (1 -
-                                        Curves.easeInCubic.transform(value))
+                              builder: (BuildContext context, Widget? child) {
+                                final double value = _fireworksController.value
                                     .clamp(0.0, 1.0);
+                                final double opacity =
+                                    (1 - Curves.easeInCubic.transform(value))
+                                        .clamp(0.0, 1.0);
                                 if (opacity <= 0) {
                                   return const SizedBox.shrink();
                                 }
                                 return Opacity(
                                   opacity: opacity,
                                   child: CustomPaint(
-                                    painter: _FireworksPainter(
-                                      progress: value,
-                                    ),
+                                    painter: _FireworksPainter(progress: value),
                                   ),
                                 );
                               },
@@ -1987,7 +2235,9 @@ class _CloudConnectPageState extends State<CloudConnectPage>
                                   borderRadius: BorderRadius.circular(24),
                                   boxShadow: <BoxShadow>[
                                     BoxShadow(
-                                      color: Colors.black.withValues(alpha: 0.08),
+                                      color: Colors.black.withValues(
+                                        alpha: 0.08,
+                                      ),
                                       blurRadius: 24,
                                       offset: const Offset(0, 12),
                                     ),
@@ -2003,7 +2253,9 @@ class _CloudConnectPageState extends State<CloudConnectPage>
                                       style: Theme.of(context)
                                           .textTheme
                                           .titleLarge
-                                          ?.copyWith(fontWeight: FontWeight.bold),
+                                          ?.copyWith(
+                                            fontWeight: FontWeight.bold,
+                                          ),
                                     ),
                                     const SizedBox(height: 16),
                                     if (_nextStagePaused)
@@ -2029,7 +2281,8 @@ class _CloudConnectPageState extends State<CloudConnectPage>
                                               fontWeight: FontWeight.bold,
                                             ),
                                       ),
-                                    if (_nextStagePaused || _nextStageCountdown > 0)
+                                    if (_nextStagePaused ||
+                                        _nextStageCountdown > 0)
                                       const SizedBox(height: 18),
                                     SizedBox(
                                       width: double.infinity,
@@ -2293,8 +2546,10 @@ class _FireworksPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final double clamped = progress.clamp(0.0, 1.0);
     final double eased = Curves.easeOutQuart.transform(clamped);
-    final double fade =
-        (1.0 - Curves.easeInCubic.transform(clamped)).clamp(0.0, 1.0);
+    final double fade = (1.0 - Curves.easeInCubic.transform(clamped)).clamp(
+      0.0,
+      1.0,
+    );
 
     for (final _FireworkBurst burst in _bursts) {
       final Offset center = Offset(
@@ -2305,8 +2560,7 @@ class _FireworksPainter extends CustomPainter {
       final double radius =
           size.shortestSide * (0.08 + eased * 0.22) * burst.scale;
       final double length = radius * (0.8 + eased * 0.6);
-      final double lineAlpha =
-          (0.55 + 0.35 * fade).clamp(0.0, 1.0).toDouble();
+      final double lineAlpha = (0.55 + 0.35 * fade).clamp(0.0, 1.0).toDouble();
       final Paint linePaint = Paint()
         ..style = PaintingStyle.stroke
         ..strokeCap = StrokeCap.round
@@ -2318,8 +2572,7 @@ class _FireworksPainter extends CustomPainter {
         final double angle = (2 * pi / sparkCount) * i;
         final Offset end = center + Offset(cos(angle), sin(angle)) * length;
         canvas.drawLine(center, end, linePaint);
-        final double dotAlpha =
-            (0.45 + 0.45 * fade).clamp(0.0, 1.0).toDouble();
+        final double dotAlpha = (0.45 + 0.45 * fade).clamp(0.0, 1.0).toDouble();
         final Paint dotPaint = Paint()
           ..style = PaintingStyle.fill
           ..color = burst.color.withValues(alpha: dotAlpha);
@@ -2327,8 +2580,7 @@ class _FireworksPainter extends CustomPainter {
         canvas.drawCircle(end, sparkleRadius, dotPaint);
       }
 
-      final double haloAlpha =
-          (0.28 + 0.4 * fade).clamp(0.0, 1.0).toDouble();
+      final double haloAlpha = (0.28 + 0.4 * fade).clamp(0.0, 1.0).toDouble();
       final Paint haloPaint = Paint()
         ..style = PaintingStyle.stroke
         ..strokeWidth = 2.2
@@ -2521,10 +2773,7 @@ class _StageBadge extends StatelessWidget {
       backgroundColor: bg,
       child: Text(
         '$stage',
-        style: TextStyle(
-          fontWeight: FontWeight.bold,
-          color: fg,
-        ),
+        style: TextStyle(fontWeight: FontWeight.bold, color: fg),
       ),
     );
   }

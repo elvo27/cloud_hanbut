@@ -1,7 +1,7 @@
 name: hanbut
-description: A new Flutter project.
+description: 구름을 한 번에 이어 기록을 쌓는 캐주얼 퍼즐 게임.
 publish_to: none
-version: 1.0.6+36
+version: 1.1.1+38
 environment:
   sdk: ^3.9.2
 dependencies:
@@ -11,6 +11,10 @@ dependencies:
   shared_preferences: ^2.3.2
   audioplayers: ^5.2.1
   supabase_flutter: ^2.0.0
+  google_mobile_ads: ^7.0.0
+  package_info_plus: ^8.3.0
+  url_launcher: ^6.3.2
+  uuid: ^4.5.1
 dev_dependencies:
   flutter_test:
     sdk: flutter

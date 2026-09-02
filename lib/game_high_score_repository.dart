@@ -4,12 +4,14 @@ enum RemoteHighScoreSort { score, latest, oldest, topStage }
 
 class RemoteHighScoreEntry {
   const RemoteHighScoreEntry({
+    this.id,
     required this.nickname,
     required this.score,
     required this.lastStage,
     required this.playedAt,
   });
 
+  final int? id;
   final String nickname;
   final int score;
   final int lastStage;
@@ -37,6 +39,7 @@ class RemoteHighScoreEntry {
     }
 
     return RemoteHighScoreEntry(
+      id: parseInt(json['id'], -1) < 0 ? null : parseInt(json['id'], -1),
       nickname: (json['nickname'] as String? ?? '').trim(),
       score: parseInt(json['score'], 0),
       lastStage: parseInt(json['last_stage'], 0),
@@ -52,17 +55,32 @@ class GameHighScoreRepository {
     required int score,
     int? lastStage,
     DateTime? playedAt,
+    String? playerId,
   }) async {
-    await Supabase.instance.client.rpc(
-      'submit_game_high_score',
-      params: <String, dynamic>{
-        'p_game_name': gameName.trim(),
-        'p_nickname': nickname.trim(),
-        'p_score': score,
-        'p_last_stage': lastStage,
-        'p_played_at': playedAt?.toUtc().toIso8601String(),
-      },
-    );
+    final Map<String, dynamic> legacyParams = <String, dynamic>{
+      'p_game_name': gameName.trim(),
+      'p_nickname': nickname.trim(),
+      'p_score': score,
+      'p_last_stage': lastStage,
+      'p_played_at': playedAt?.toUtc().toIso8601String(),
+    };
+    try {
+      await Supabase.instance.client.rpc(
+        'submit_game_high_score',
+        params: <String, dynamic>{
+          ...legacyParams,
+          if (playerId != null) 'p_player_id': playerId,
+        },
+      );
+    } on PostgrestException catch (error) {
+      if (playerId == null || error.code != 'PGRST202') {
+        rethrow;
+      }
+      await Supabase.instance.client.rpc(
+        'submit_game_high_score',
+        params: legacyParams,
+      );
+    }
   }
 
   Future<List<RemoteHighScoreEntry>> fetchHighScores({
@@ -72,7 +90,7 @@ class GameHighScoreRepository {
   }) async {
     final baseQuery = Supabase.instance.client
         .from('game_high_scores')
-        .select('nickname, score, last_stage, played_at')
+        .select('id, nickname, score, last_stage, played_at')
         .eq('game_name', gameName.trim());
 
     final List<dynamic> rows;
@@ -110,5 +128,20 @@ class GameHighScoreRepository {
         )
         .where((RemoteHighScoreEntry entry) => entry.nickname.isNotEmpty)
         .toList(growable: false);
+  }
+
+  Future<void> reportHighScore({
+    required int scoreId,
+    required String reporterId,
+    required String reason,
+  }) async {
+    await Supabase.instance.client.rpc(
+      'report_game_high_score',
+      params: <String, dynamic>{
+        'p_score_id': scoreId,
+        'p_reporter_id': reporterId,
+        'p_reason': reason.trim(),
+      },
+    );
   }
 }
